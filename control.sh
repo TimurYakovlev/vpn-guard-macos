@@ -10,7 +10,7 @@ if [ "$(id -u)" = 0 ]; then
   exit 1
 fi
 # A Finder session does not normally inherit the Homebrew PATH.
-PATH="/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
 export PATH
 PYTHON=$(command -v python3 || true)
 if [ -z "$PYTHON" ] || ! "$PYTHON" -c 'import sys; assert sys.version_info >= (3,10)' 2>/dev/null; then
