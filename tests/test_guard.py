@@ -125,7 +125,7 @@ class GuardTest(unittest.TestCase):
         import time
         # Isolated HOME, unique executable and unique launchd label. No VPN is changed.
         with tempfile.TemporaryDirectory() as directory:
-            home=Path(directory)
+            home=Path(directory).resolve()
             root=home/'Library/Application Support/VPN Guard'
             agent=home/'Library/LaunchAgents/test.plist'
             label='org.vpnguard.test.'+uuid.uuid4().hex
@@ -149,7 +149,8 @@ class GuardTest(unittest.TestCase):
                             break
                         time.sleep(0.2)
                     else:
-                        self.fail('LaunchAgent did not start the watcher and pause the isolated process')
+                        detail=subprocess.run(['/bin/launchctl','print','gui/'+str(os.getuid())+'/'+label],capture_output=True,text=True).stdout
+                        self.fail('LaunchAgent did not pause the isolated process; status='+str(g.load(root/'status.json',{}))+' process='+str(g.processes().get(process.pid))+' launchd='+detail)
                     self.assertFalse(g.load(root/'status.json')['healthy'])
                     g.uninstall()
                     time.sleep(0.2)
