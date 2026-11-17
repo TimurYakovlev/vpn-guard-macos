@@ -5,6 +5,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import shutil
+import shlex
+import uuid
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -116,6 +119,46 @@ class GuardTest(unittest.TestCase):
                 self.assertFalse(agent.exists())
                 self.assertFalse(script.exists())
                 self.assertFalse(g.load(directory/'status.json')['healthy'])
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS integration test')
+    def test_launchagent_install_watch_and_uninstall(self):
+        import time
+        # Isolated HOME, unique executable and unique launchd label. No VPN is changed.
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory)
+            root=home/'Library/Application Support/VPN Guard'
+            agent=home/'Library/LaunchAgents/test.plist'
+            label='org.vpnguard.test.'+uuid.uuid4().hex
+            sleeper=home/'isolated-sleep'
+            shutil.copyfile('/bin/sleep',sleeper); sleeper.chmod(0o700)
+            process=subprocess.Popen([str(sleeper),'60'])
+            wrapper=home/'python-with-private-home'
+            wrapper.write_text('#!/bin/sh\nexec /usr/bin/env HOME='+shlex.quote(str(home))+' '+shlex.quote(sys.executable)+' "$@"\n')
+            wrapper.chmod(0o700)
+            def configure():
+                g.save(root/'config.json',dict(expected_ipv4='1.1.1.1',expected_ipv6=None,paths=[str(sleeper)]))
+            try:
+                with patch.object(g,'ROOT',root), patch.object(g,'AGENT',agent), \
+                     patch.object(g,'LABEL',label), patch.object(g,'configure',side_effect=configure), \
+                     patch.object(g.sys,'executable',str(wrapper)):
+                    g.install()
+                    deadline=time.monotonic()+12
+                    while time.monotonic()<deadline:
+                        current=g.processes().get(process.pid)
+                        if current and current['stopped'] and (root/'status.json').exists():
+                            break
+                        time.sleep(0.2)
+                    else:
+                        self.fail('LaunchAgent did not start the watcher and pause the isolated process')
+                    self.assertFalse(g.load(root/'status.json')['healthy'])
+                    g.uninstall()
+                    time.sleep(0.2)
+                    self.assertFalse(g.processes()[process.pid]['stopped'])
+                    self.assertFalse(agent.exists())
+            finally:
+                subprocess.run(['/bin/launchctl','bootout','gui/'+str(os.getuid())+'/'+label],capture_output=True)
+                os.kill(process.pid,signal.SIGCONT)
+                process.terminate(); process.wait(timeout=5)
 
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS integration test')
     def test_real_process_pause_recovery_and_libproc(self):
