@@ -102,6 +102,21 @@ class GuardTest(unittest.TestCase):
             with patch.object(g,'route',side_effect=routes), patch.object(g,'public_ip',return_value='1.1.1.1'):
                 self.assertEqual(g.check_network({'expected_ipv4':'1.1.1.1'})[0],healthy)
 
+    def test_uninstall_after_manual_bootout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory)
+            agent=directory/'test.plist'; agent.write_text('fixture')
+            script=directory/'vpn_guard.py'; script.write_text('fixture')
+            with patch.object(g,'ROOT',directory), patch.object(g,'AGENT',agent), \
+                 patch.object(g.os,'getuid',return_value=501,create=True), \
+                 patch.object(g.subprocess,'run',return_value=SimpleNamespace(returncode=3)), \
+                 patch.object(g,'lock'), patch.object(g,'Controller') as controller:
+                g.uninstall()
+                controller.return_value.step.assert_called_once_with([],True)
+                self.assertFalse(agent.exists())
+                self.assertFalse(script.exists())
+                self.assertFalse(g.load(directory/'status.json')['healthy'])
+
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS integration test')
     def test_real_process_pause_recovery_and_libproc(self):
         # Only this test's own /bin/sleep PID is ever handed to the controller.

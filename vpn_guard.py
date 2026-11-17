@@ -296,7 +296,11 @@ def install():
 
 def uninstall():
     if AGENT.exists():
-        run(['/bin/launchctl', 'bootout', 'gui/' + str(os.getuid()), str(AGENT)], timeout=10)
+        domain = 'gui/' + str(os.getuid())
+        present = subprocess.run(['/bin/launchctl', 'print', domain + '/' + LABEL],
+                                 capture_output=True, timeout=5)
+        if present.returncode == 0:
+            run(['/bin/launchctl', 'bootout', domain, str(AGENT)], timeout=10)
         AGENT.unlink()
     singleton = lock(ROOT)
     Controller().step([], True)
