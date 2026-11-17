@@ -162,7 +162,8 @@ def selected(snapshot, targets, paused):
 
 
 class Controller:
-    def __init__(self, directory=ROOT, scan=processes, send=os.kill):
+    def __init__(self, directory=None, scan=processes, send=os.kill):
+        directory = ROOT if directory is None else directory
         self.directory, self.scan, self.send = directory, scan, send
         self.paused = load(directory / 'paused.json', {})
 
@@ -290,7 +291,16 @@ def install():
     with AGENT.open('wb') as stream:
         plistlib.dump(data, stream)
     os.chmod(AGENT, 0o600)
+    started = time.time()
     run(['/bin/launchctl', 'bootstrap', 'gui/' + str(os.getuid()), str(AGENT)], timeout=10)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        status = load(ROOT / 'status.json', {})
+        if status.get('time', 0) >= started:
+            break
+        time.sleep(0.2)
+    else:
+        raise RuntimeError('LaunchAgent installed, but no fresh watcher heartbeat. Use uninstall and check the launchctl status in README.')
     print('Installed for this macOS user. Use status.command to verify a fresh heartbeat.')
 
 
@@ -302,11 +312,11 @@ def uninstall():
         if present.returncode == 0:
             run(['/bin/launchctl', 'bootout', domain, str(AGENT)], timeout=10)
         AGENT.unlink()
-    singleton = lock(ROOT)
-    Controller().step([], True)
-    # Preserve config and status for diagnosis. No recursive deletion.
-    (ROOT / 'vpn_guard.py').unlink(missing_ok=True)
-    save(ROOT / 'status.json', dict(time=time.time(), healthy=False, reason='UNINSTALLED: watcher disabled', paused=0))
+    with lock(ROOT):
+        Controller().step([], True)
+        # Preserve config and status for diagnosis. No recursive deletion.
+        (ROOT / 'vpn_guard.py').unlink(missing_ok=True)
+        save(ROOT / 'status.json', dict(time=time.time(), healthy=False, reason='UNINSTALLED: watcher disabled', paused=0))
     print('Watcher disabled; its surviving paused processes resumed. Local config retained.')
 
 
@@ -325,8 +335,8 @@ def main():
     elif command == 'uninstall':
         uninstall()
     elif command == 'resume':
-        singleton = lock(ROOT)
-        Controller().step([], True)
+        with lock(ROOT):
+            Controller().step([], True)
         print('Recorded processes resumed. This does not enable protection.')
     else:
         status = load(ROOT / 'status.json', {})
