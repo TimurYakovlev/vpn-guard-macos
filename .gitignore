@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+config.json
+paused.json
+status.json
+*.lock
+*.tmp
+*.log
+*.session*
+.env*
+.DS_Store
