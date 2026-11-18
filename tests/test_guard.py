@@ -105,6 +105,39 @@ class GuardTest(unittest.TestCase):
             with patch.object(g,'route',side_effect=routes), patch.object(g,'public_ip',return_value='1.1.1.1'):
                 self.assertEqual(g.check_network({'expected_ipv4':'1.1.1.1'})[0],healthy)
 
+    def test_work_session_starts_recovers_and_ends(self):
+        cases = (
+            (False, None, None, 'waiting'),   # First watcher tick after login.
+            (False, False, None, 'waiting'),  # No VPN to protect yet.
+            (False, True, None, 'waiting'),   # A tunnel alone is not enough.
+            (True, True, None, 'active'),
+            (False, False, None, 'active'),   # A sudden drop preserves protection.
+            (True, True, None, 'active'),
+            (True, True, 'end', 'ended'),
+            (False, None, None, 'ended'),     # Unknown network cannot end the suppression.
+            (False, True, None, 'ended'),    # Changed IP cannot rearm an ended session.
+            (True, True, None, 'ended'),
+            (False, False, None, 'waiting'),
+            (True, True, None, 'active'),
+            (False, False, 'end', 'waiting'), # Explicit release after a disconnect.
+            (True, True, None, 'active'),
+            (True, True, 'end', 'ended'),
+            (True, True, 'begin', 'active'),
+        )
+        mode = 'waiting'
+        for healthy, tunnel_present, command, expected in cases:
+            mode = g.next_session_mode(mode, healthy, tunnel_present, command)
+            self.assertEqual(mode, expected)
+
+    def test_watcher_restart_preserves_session_only_in_same_boot(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(g, 'ROOT', Path(directory)):
+            for mode in ('active', 'ended'):
+                g.save(g.ROOT / 'session.json', dict(boot='boot-one', mode=mode, command_id='applied'))
+                self.assertEqual(g.read_session('boot-one')['mode'], mode)
+                fresh = g.read_session('boot-two')
+                self.assertEqual(fresh['mode'], 'waiting')
+                self.assertIsNone(fresh['command_id'])
+
     def test_uninstall_after_manual_bootout(self):
         with tempfile.TemporaryDirectory() as directory:
             directory=Path(directory)
@@ -132,26 +165,62 @@ class GuardTest(unittest.TestCase):
             sleeper=home/'isolated-sleep'
             shutil.copyfile('/bin/sleep',sleeper); sleeper.chmod(0o700)
             process=subprocess.Popen([str(sleeper),'60'])
+            network = root / 'test-network.json'
+            g.save(network, {'up': False})
+            harness = home / 'watch-with-fixture-network.py'
+            harness.write_text('''
+import importlib.util
+import sys
+from pathlib import Path
+
+script, *args = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('vpn_guard', script)
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+network = Path(script).parent / 'test-network.json'
+guard.route = lambda family: ('utun7' if guard.load(network)['up'] else 'en0') if family == 4 else None
+guard.public_ip = lambda *args: '1.1.1.1'
+sys.argv = [script, *args]
+guard.main()
+''', encoding='utf-8')
             wrapper=home/'python-with-private-home'
-            wrapper.write_text('#!/bin/sh\nexec /usr/bin/env HOME='+shlex.quote(str(home))+' '+shlex.quote(sys.executable)+' "$@"\n')
+            wrapper.write_text('#!/bin/sh\nexec /usr/bin/env HOME='+shlex.quote(str(home))+' '+shlex.quote(sys.executable)+' '+shlex.quote(str(harness))+' "$@"\n')
             wrapper.chmod(0o700)
             def configure():
                 g.save(root/'config.json',dict(expected_ipv4='1.1.1.1',expected_ipv6=None,paths=[str(sleeper)]))
+            def wait_status(mode, healthy, stopped):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    status = g.load(root / 'status.json', {})
+                    current = g.processes().get(process.pid)
+                    if (current and current['stopped'] == stopped and status.get('mode') == mode
+                            and status.get('healthy') == healthy and g.heartbeat_fresh(status)):
+                        return
+                    time.sleep(0.2)
+                detail = subprocess.run(['/bin/launchctl','print','gui/'+str(os.getuid())+'/'+label],capture_output=True,text=True).stdout
+                self.fail(f'Expected {mode=} {healthy=} {stopped=}, got {status=} {current=} {detail=}')
             try:
                 with patch.object(g,'ROOT',root), patch.object(g,'AGENT',agent), \
                      patch.object(g,'LABEL',label), patch.object(g,'configure',side_effect=configure), \
                      patch.object(g.sys,'executable',str(wrapper)):
                     g.install()
-                    deadline=time.monotonic()+12
-                    while time.monotonic()<deadline:
-                        current=g.processes().get(process.pid)
-                        if current and current['stopped'] and (root/'status.json').exists():
-                            break
-                        time.sleep(0.2)
-                    else:
-                        detail=subprocess.run(['/bin/launchctl','print','gui/'+str(os.getuid())+'/'+label],capture_output=True,text=True).stdout
-                        self.fail('LaunchAgent did not pause the isolated process; status='+str(g.load(root/'status.json',{}))+' process='+str(g.processes().get(process.pid))+' launchd='+detail)
-                    self.assertFalse(g.load(root/'status.json')['healthy'])
+                    wait_status('waiting', False, False)
+                    g.save(network, {'up': True})
+                    wait_status('active', True, False)
+                    g.save(network, {'up': False})
+                    wait_status('active', False, True)
+                    g.save(network, {'up': True})
+                    wait_status('active', True, False)
+                    g.request_session('end')
+                    wait_status('ended', True, False)
+                    g.save(network, {'up': False})
+                    wait_status('waiting', False, False)
+                    g.save(network, {'up': True})
+                    wait_status('active', True, False)
+                    g.save(network, {'up': False})
+                    wait_status('active', False, True)
+                    g.request_session('end')
+                    wait_status('waiting', False, False)
                     g.uninstall()
                     time.sleep(0.2)
                     self.assertFalse(g.processes()[process.pid]['stopped'])
