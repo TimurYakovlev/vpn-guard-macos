@@ -14,8 +14,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 
 ROOT = Path.home() / 'Library/Application Support/VPN Guard'
 LABEL = 'org.vpnguard.macos.watcher'
@@ -30,11 +32,15 @@ def run(args, timeout=2):
 
 def save(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
-    with temporary.open('w', encoding='utf-8') as stream:
-        os.chmod(temporary, 0o600)
-        json.dump(data, stream, ensure_ascii=False, indent=2)
-    os.replace(temporary, path)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                     prefix=path.name + '.', suffix='.tmp', delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def load(path, default=None):
@@ -71,8 +77,8 @@ def public_ip(family, interface):
     return str(ip)
 
 
-def check_network(config):
-    v4, v6 = route(4), route(6)
+def check_network(config, routes=None):
+    v4, v6 = (route(4), route(6)) if routes is None else routes
     if not tunnel(v4):
         return False, 'IPv4 route is outside a utun VPN'
     if v6 is not None and v6 != v4:
@@ -213,39 +219,102 @@ def lock(directory):
     return stream
 
 
+def boot_session():
+    return str(uuid.UUID(run(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'])))
+
+
+def next_session_mode(mode, healthy, tunnel_present, command=None):
+    if command == 'end':
+        return 'waiting' if tunnel_present is False else 'ended'
+    if command == 'begin':
+        return 'active' if healthy else 'waiting'
+    if mode == 'active':
+        return mode
+    if mode == 'ended' and tunnel_present is not False:
+        return mode
+    return 'active' if healthy else 'waiting'
+
+
+def read_session(boot):
+    defaults = dict(boot=boot, mode='waiting', command_id=None)
+    old = load(ROOT / 'session.json', {})
+    if old.get('boot') == boot and old.get('mode') in ('waiting', 'active', 'ended'):
+        return dict(defaults, mode=old['mode'], command_id=old.get('command_id'))
+    return defaults
+
+
+def request_session(command):
+    status = load(ROOT / 'status.json', {})
+    if status.get('mode') not in ('waiting', 'active', 'ended') or not heartbeat_fresh(status):
+        raise RuntimeError('No current session-aware watcher is responding. Check installation with status.')
+    command_id = uuid.uuid4().hex
+    save(ROOT / 'session-command.json', dict(id=command_id, boot=boot_session(), command=command))
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        status = load(ROOT / 'status.json', {})
+        if status.get('command_id') == command_id and heartbeat_fresh(status) and not status.get('error'):
+            print(status['reason'])
+            return
+        time.sleep(0.1)
+    raise RuntimeError('Session command was not confirmed. Check status before disconnecting the VPN.')
+
+
+def heartbeat_fresh(status):
+    return 0 <= time.time() - status.get('time', 0) < 5
+
+
 def watch():
     singleton = lock(ROOT)
     config = validate(load(ROOT / 'config.json'))
     controller = Controller()
-    # First pause targets. No network request delays this initial action.
-    controller.step(config['paths'], False)
-    health = {'ok': False, 'reason': 'Checking VPN', 'checked': 0.0}
+    boot = boot_session()
+    session = read_session(boot)
+    health = {'ok': False, 'reason': 'Checking VPN', 'checked': 0.0, 'tunnel': None}
     mutex = threading.Lock()
 
     def probe():
         while True:
+            present = None
             try:
-                ok, reason = check_network(config)
+                v4 = route(4)
+                present = tunnel(v4)
+                ok, reason = check_network(config, (v4, route(6)))
             except Exception as error:
                 ok, reason = False, type(error).__name__ + ': network check failed'
             with mutex:
-                health.update(ok=ok, reason=reason, checked=time.monotonic())
+                health.update(ok=ok, reason=reason, checked=time.monotonic(), tunnel=present)
             time.sleep(1)
 
     threading.Thread(target=probe, daemon=True).start()
     while True:
         with mutex:
-            healthy = health['ok'] and time.monotonic() - health['checked'] < 8
-            reason = health['reason']
-        if not healthy:
-            reason = reason if not health['ok'] else 'Network check expired'
+            fresh = time.monotonic() - health['checked'] < 8
+            healthy = health['ok'] and fresh
+            present = health['tunnel'] if fresh else None
+            reason = 'Network check expired' if health['ok'] and not fresh else health['reason']
         try:
-            controller.step(config['paths'], healthy)
-            save(ROOT / 'status.json', dict(time=time.time(), healthy=healthy,
-                 reason=reason, paused=len(controller.paused)))
+            command_record = load(ROOT / 'session-command.json', {})
+            command = None
+            command_id = session['command_id']
+            if (command_record.get('boot') == boot and command_record.get('id') != command_id
+                    and command_record.get('command') in ('begin', 'end')):
+                command = command_record['command']
+                command_id = command_record['id']
+            mode = next_session_mode(session['mode'], healthy, present, command)
+            updated = dict(boot=boot, mode=mode, command_id=command_id)
+            if updated != session:
+                save(ROOT / 'session.json', updated)
+                session = updated
+            if mode == 'waiting':
+                reason = 'Waiting for the trusted VPN. Applications are free to run.'
+            elif mode == 'ended':
+                reason = 'Session ended. You can disconnect the VPN now.'
+            controller.step(config['paths'], mode != 'active' or healthy)
+            save(ROOT / 'status.json', dict(time=time.time(), mode=mode, healthy=healthy,
+                 reason=reason, paused=len(controller.paused), command_id=command_id))
         except Exception as error:
-            save(ROOT / 'status.json', dict(time=time.time(), healthy=False,
-                 reason='Process control failed: ' + type(error).__name__, paused=len(controller.paused)))
+            save(ROOT / 'status.json', dict(time=time.time(), mode=session['mode'], healthy=False,
+                 error=True, reason='Session watcher failed: ' + type(error).__name__, paused=len(controller.paused)))
             raise  # launchd restarts the watcher; paused processes stay paused.
         time.sleep(0.5)
 
@@ -316,13 +385,15 @@ def uninstall():
         Controller().step([], True)
         # Preserve config and status for diagnosis. No recursive deletion.
         (ROOT / 'vpn_guard.py').unlink(missing_ok=True)
+        (ROOT / 'session.json').unlink(missing_ok=True)
+        (ROOT / 'session-command.json').unlink(missing_ok=True)
         save(ROOT / 'status.json', dict(time=time.time(), healthy=False, reason='UNINSTALLED: watcher disabled', paused=0))
     print('Watcher disabled; its surviving paused processes resumed. Local config retained.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['install','watch','status','resume','uninstall'])
+    parser.add_argument('command', choices=['install','watch','status','begin','end','resume','uninstall'])
     command = parser.parse_args().command
     if sys.platform != 'darwin':
         parser.error('Only macOS is supported. Tests can run on other platforms.')
@@ -334,15 +405,18 @@ def main():
         watch()
     elif command == 'uninstall':
         uninstall()
+    elif command in ('begin', 'end'):
+        request_session(command)
     elif command == 'resume':
         with lock(ROOT):
             Controller().step([], True)
         print('Recorded processes resumed. This does not enable protection.')
     else:
         status = load(ROOT / 'status.json', {})
-        status['heartbeat_fresh'] = 0 <= time.time() - status.get('time', 0) < 5
+        status['heartbeat_fresh'] = heartbeat_fresh(status)
         print(json.dumps(status, ensure_ascii=False, indent=2))
-        if not status['heartbeat_fresh'] or not status.get('healthy'):
+        if (not status['heartbeat_fresh'] or status.get('error') or
+                (status.get('mode') not in ('waiting', 'ended') and not status.get('healthy'))):
             sys.exit(1)
 
 

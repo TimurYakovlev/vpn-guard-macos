@@ -3,6 +3,8 @@ __pycache__/
 config.json
 paused.json
 status.json
+session.json
+session-command.json
 *.lock
 *.tmp
 *.log
