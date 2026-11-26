@@ -19,3 +19,13 @@ jobs:
             sh -n "$file" || exit 1
           done
       - run: python -m py_compile vpn_guard.py
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native x64 WFP library
+        shell: powershell
+        run: .\windows\Build.ps1
+      - name: Check discovery and work-session logic without installing filters
+        shell: powershell
+        run: .\windows\SelfTest.ps1

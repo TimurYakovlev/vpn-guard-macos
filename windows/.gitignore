@@ -1,0 +1,12 @@
+*.dll
+policy.json
+state.json
+engine-config.json
+engine-health.json
+package-version.txt
+*-error.txt
+*-status.json
+*.lnk
+*.log
+test-fixtures-*/
+SHA256SUMS.txt
